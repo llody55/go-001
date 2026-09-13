@@ -2,7 +2,6 @@ package cali
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -29,6 +28,45 @@ func planMatchEnd(calibDate string) string {
 		return calibDate
 	}
 	return t.AddDate(0, 0, earlyFinishToleranceDays).Format("2006-01-02")
+}
+
+// planMatchStart 计划核销窗口左端：校准日期 - 一个校准周期，格式 yyyy-MM-dd。
+// 核销只允许落在本次校准对应的周期内，避免晚发证时错销更早的往期计划行。
+func planMatchStart(calibDate string, cycleMonths int) string {
+	t, err := time.ParseInLocation("2006-01-02", calibDate, time.Local)
+	if err != nil {
+		return calibDate
+	}
+	return t.AddDate(0, -cycleMonths, 0).Format("2006-01-02")
+}
+
+func nearestPlan(plans []TCaliPlan, calib time.Time) TCaliPlan {
+	if len(plans) == 0 {
+		return TCaliPlan{}
+	}
+	selected := plans[0]
+	selectedDays := daysBetween(calib, selected.PlanDate)
+	for _, plan := range plans[1:] {
+		days := daysBetween(calib, plan.PlanDate)
+		if days < selectedDays || (days == selectedDays && plan.PlanDate > selected.PlanDate) ||
+			(days == selectedDays && plan.PlanDate == selected.PlanDate && plan.ID > selected.ID) {
+			selected = plan
+			selectedDays = days
+		}
+	}
+	return selected
+}
+
+func daysBetween(base time.Time, date string) int {
+	t, err := time.ParseInLocation("2006-01-02", date, time.Local)
+	if err != nil {
+		return int(^uint(0) >> 1)
+	}
+	days := int(base.Sub(t).Hours() / 24)
+	if days < 0 {
+		return -days
+	}
+	return days
 }
 
 // PlanService 年度检定计划编制、到期看板与提醒。
@@ -200,18 +238,28 @@ func (s *PlanService) AfterIssue(ctx context.Context, tx *gorm.DB, rec *TCaliRec
 	if rec == nil {
 		return nil
 	}
-	// 核销该器具最早一条待安排行，一次发证只核销一行，更早被漏掉的计划行优先核销。
-	// 核销窗口：计划日期 <= 校准日期 + 提前完工容差。现场常在计划日前几天顺手检完，
-	// 若严格要求「校准日不早于计划日」，提前完工的记录发证后计划行仍挂待安排、
-	// 超期后天天催检；放宽一个容差即可覆盖提前完工，且容差小于常见最短周期（月），
-	// 不会误核销下一期计划行。
-	var plan TCaliPlan
-	err := tx.WithContext(ctx).
-		Where("device_id = ? and status = 0 and plan_date <= ?", rec.DeviceID, planMatchEnd(rec.CalibDate)).
-		Order("plan_date asc, id asc").First(&plan).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	calib, err := time.ParseInLocation("2006-01-02", rec.CalibDate, time.Local)
+	if err != nil {
+		return common.NewBizError("校准日期格式不正确，应为 yyyy-MM-dd")
+	}
+
+	var dev TCaliDevice
+	if err := tx.WithContext(ctx).First(&dev, rec.DeviceID).Error; err != nil {
 		return err
 	}
+
+	// 一次发证只核销本次校准对应周期内的一行计划：计划日期不早于校准日期前一个周期，
+	// 且不晚于校准日期 + 提前完工容差。这样往期漏检行不会被本次发证冲销，当前周期的
+	// 计划行也不会继续挂待安排。
+	var plans []TCaliPlan
+	err = tx.WithContext(ctx).
+		Where("device_id = ? and status = 0 and plan_date >= ? and plan_date <= ?",
+			rec.DeviceID, planMatchStart(rec.CalibDate, dev.CycleMonths), planMatchEnd(rec.CalibDate)).
+		Order("plan_date asc, id asc").Find(&plans).Error
+	if err != nil {
+		return err
+	}
+	plan := nearestPlan(plans, calib)
 	if plan.ID != 0 {
 		if err := tx.WithContext(ctx).Model(&TCaliPlan{}).Where("id = ?", plan.ID).
 			Updates(map[string]any{"status": 1, "record_id": rec.ID}).Error; err != nil {
@@ -219,15 +267,6 @@ func (s *PlanService) AfterIssue(ctx context.Context, tx *gorm.DB, rec *TCaliRec
 		}
 	}
 
-	// 以本次校准日期为基准滚动档案的上次/下次检定日期。
-	var dev TCaliDevice
-	if err := tx.WithContext(ctx).First(&dev, rec.DeviceID).Error; err != nil {
-		return err
-	}
-	calib, err := time.ParseInLocation("2006-01-02", rec.CalibDate, time.Local)
-	if err != nil {
-		return common.NewBizError("校准日期格式不正确，应为 yyyy-MM-dd")
-	}
 	return tx.WithContext(ctx).Model(&TCaliDevice{}).Where("id = ?", dev.ID).
 		Updates(map[string]any{
 			"last_calib_date": rec.CalibDate,
