@@ -14,6 +14,8 @@ import (
 // RecordService 校准记录登记。
 type RecordService struct {
 	db *gorm.DB
+	// AfterCalibration 校准记录落库后的联动（计划核销、档案日期滚动）。
+	AfterCalibration func(context.Context, *TCaliRecord)
 }
 
 func NewRecordService(db *gorm.DB) *RecordService { return &RecordService{db: db} }
@@ -63,6 +65,9 @@ func (s *RecordService) Create(ctx context.Context, in RecordInput) (*TCaliRecor
 	}
 	if err := s.db.WithContext(ctx).Create(&rec).Error; err != nil {
 		return nil, err
+	}
+	if s.AfterCalibration != nil {
+		s.AfterCalibration(ctx, &rec)
 	}
 	return &rec, nil
 }

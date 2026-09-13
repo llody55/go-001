@@ -8,7 +8,6 @@ import (
 	"log"
 
 	"metrobase/internal/config"
-	"metrobase/internal/cronjob"
 	"metrobase/internal/db"
 	"metrobase/internal/router"
 )
@@ -43,13 +42,7 @@ func main() {
 		log.Printf("已按 %s 初始化数据库", *schema)
 	}
 
-	// 定时任务从 t_sys_job 恢复（进程重启不丢任务配置）
-	scheduler := cronjob.NewScheduler(gdb)
-	scheduler.RegisterFunc("calibration_due_notice", func() {}) // 后续迭代实现到期提醒
-	if err := scheduler.Start(); err != nil {
-		log.Fatalf("定时任务启动失败：%v", err)
-	}
-
+	// 定时任务随路由装配从 t_sys_job 恢复（进程重启不丢任务配置）。
 	engine := router.NewEngine(gdb, secret, cfg.JWT.ExpireHours)
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("solo 服务已启动：%s（本地 SQLite %s）", addr, cfg.Database.DSN)

@@ -6,6 +6,7 @@ import (
 
 	"metrobase/internal/auth"
 	"metrobase/internal/cali"
+	"metrobase/internal/cronjob"
 	"metrobase/internal/response"
 	"metrobase/internal/sys"
 )
@@ -24,8 +25,20 @@ func NewEngine(gdb *gorm.DB, jwtSecret string, expireHours int) *gin.Engine {
 	protected := r.Group("/api")
 	protected.Use(auth.Middleware(jwtSecret))
 
-	caliCtl := cali.NewController(cali.NewRecordService(gdb))
+	// 定时任务从 t_sys_job 恢复（进程重启不丢任务配置）
+	scheduler := cronjob.NewScheduler(gdb)
+
+	recordSvc := cali.NewRecordService(gdb)
+	planSvc := cali.NewPlanService(gdb, scheduler)
+	recordSvc.AfterCalibration = planSvc.AfterCalibration
+
+	caliCtl := cali.NewController(recordSvc)
 	caliCtl.Register(protected)
+
+	planCtl := cali.NewPlanController(planSvc)
+	planCtl.Register(protected)
+
+	_ = scheduler.Start()
 
 	return r
 }

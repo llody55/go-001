@@ -1,6 +1,10 @@
 package cali
 
-import "metrobase/internal/common"
+import (
+	"time"
+
+	"metrobase/internal/common"
+)
 
 // TCaliDevice 计量器具档案，对应表 t_cali_device。
 type TCaliDevice struct {
@@ -38,3 +42,19 @@ type TCaliRecord struct {
 }
 
 func (TCaliRecord) TableName() string { return "t_cali_record" }
+
+// TCaliPlan 年度检定计划行（t_cali_plan）：一台器具一个应校准日期一行。
+type TCaliPlan struct {
+	common.BaseModel
+	PlanNo     string     `gorm:"column:plan_no" json:"planNo"`
+	Year       int        `gorm:"column:year" json:"year"`
+	DeviceID   uint64     `gorm:"column:device_id" json:"deviceId"`
+	DeviceNo   string     `gorm:"column:device_no" json:"deviceNo"` // 冗余档案字段，以档案为准
+	DeviceName string     `gorm:"column:device_name" json:"deviceName"`
+	PlanDate   string     `gorm:"column:plan_date" json:"planDate"` // 计划应校准日期（自然日 yyyy-MM-dd）
+	Status     int        `gorm:"column:status" json:"status"`      // 0=待安排 1=已完成
+	RecordID   *uint64    `gorm:"column:record_id" json:"recordId"`
+	NoticeTime *time.Time `gorm:"column:notice_time" json:"noticeTime"`
+}
+
+func (TCaliPlan) TableName() string { return "t_cali_plan" }
