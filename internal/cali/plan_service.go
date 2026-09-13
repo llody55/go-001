@@ -17,6 +17,20 @@ import (
 // 催检任务在 t_sys_job 中的函数标识，调度器据此从库里恢复。
 const noticeFuncKey = "calibration_due_notice"
 
+// earlyFinishToleranceDays 提前完工容差（天）：校准日期早于计划日期不超过该天数时，
+// 发证即核销该计划行。取值小于常见最短检定周期（1 个月），不会跨行核销下一期。
+const earlyFinishToleranceDays = 30
+
+// planMatchEnd 计划核销窗口右端：校准日期 + 提前完工容差，格式 yyyy-MM-dd。
+// 校准日期非法时原样返回，查询匹配不到任何行，由后续日期校验报错。
+func planMatchEnd(calibDate string) string {
+	t, err := time.ParseInLocation("2006-01-02", calibDate, time.Local)
+	if err != nil {
+		return calibDate
+	}
+	return t.AddDate(0, 0, earlyFinishToleranceDays).Format("2006-01-02")
+}
+
 // PlanService 年度检定计划编制、到期看板与提醒。
 type PlanService struct {
 	db    *gorm.DB
@@ -186,11 +200,14 @@ func (s *PlanService) AfterIssue(ctx context.Context, tx *gorm.DB, rec *TCaliRec
 	if rec == nil {
 		return nil
 	}
-	// 核销该器具「计划日期 <= 本次校准日期」中最早的一条待安排行：
-	// 一次发证只核销一行，更早被漏掉的计划行优先核销。
+	// 核销该器具最早一条待安排行，一次发证只核销一行，更早被漏掉的计划行优先核销。
+	// 核销窗口：计划日期 <= 校准日期 + 提前完工容差。现场常在计划日前几天顺手检完，
+	// 若严格要求「校准日不早于计划日」，提前完工的记录发证后计划行仍挂待安排、
+	// 超期后天天催检；放宽一个容差即可覆盖提前完工，且容差小于常见最短周期（月），
+	// 不会误核销下一期计划行。
 	var plan TCaliPlan
 	err := tx.WithContext(ctx).
-		Where("device_id = ? and status = 0 and plan_date <= ?", rec.DeviceID, rec.CalibDate).
+		Where("device_id = ? and status = 0 and plan_date <= ?", rec.DeviceID, planMatchEnd(rec.CalibDate)).
 		Order("plan_date asc, id asc").First(&plan).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err

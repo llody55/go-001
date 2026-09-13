@@ -118,3 +118,35 @@ INSERT INTO t_cali_device
 SELECT 4, 'JL-Y-004', '旧型压力表', 'Y-60', 1.6, 2.5, '检修班', '孙修', 1,
        '2025-02-01', 12, '2026-02-01', '2026-09-12 09:00:00', '2026-09-12 09:00:00'
 WHERE NOT EXISTS (SELECT 1 FROM t_cali_device WHERE id = 4);
+
+-- 数据修复：补发证书时「提前于计划日检完」漏核销的计划行
+-- （旧核销条件 plan_date <= 校准日期，校准日早于计划日时匹配不到）。
+-- 规则与发证联动一致：已发证且尚未关联计划行的记录，核销本设备最早的待安排行，
+-- 计划日期须落在校准日期 +30 天的提前完工窗口内。
+-- 双向「最早配最早」的 NOT EXISTS 配对天然是 1:1（一次发证只核销一行）；
+-- 幂等：已完成计划行、已关联记录均不参与，可重复执行，同设备多行漏检时逐轮收敛。
+UPDATE t_cali_plan AS p
+SET status      = 1,
+    record_id   = rr.id,
+    update_time = datetime('now', 'localtime')
+FROM t_cali_record AS rr
+WHERE p.status = 0 AND p.del_flag IS NULL
+  AND rr.status = 1 AND rr.del_flag IS NULL
+  AND rr.device_id = p.device_id
+  AND p.plan_date <= date(rr.calib_date, '+30 day')
+  AND NOT EXISTS (
+      SELECT 1 FROM t_cali_plan q WHERE q.record_id = rr.id AND q.del_flag IS NULL
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM t_cali_plan p2
+      WHERE p2.device_id = p.device_id AND p2.status = 0 AND p2.del_flag IS NULL
+        AND p2.plan_date <= date(rr.calib_date, '+30 day')
+        AND (p2.plan_date < p.plan_date OR (p2.plan_date = p.plan_date AND p2.id < p.id))
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM t_cali_record r2
+      WHERE r2.device_id = rr.device_id AND r2.status = 1 AND r2.del_flag IS NULL
+        AND p.plan_date <= date(r2.calib_date, '+30 day')
+        AND NOT EXISTS (SELECT 1 FROM t_cali_plan q WHERE q.record_id = r2.id AND q.del_flag IS NULL)
+        AND (r2.calib_date < rr.calib_date OR (r2.calib_date = rr.calib_date AND r2.id < rr.id))
+  );
