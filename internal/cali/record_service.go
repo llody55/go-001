@@ -14,8 +14,8 @@ import (
 // RecordService 校准记录登记。
 type RecordService struct {
 	db *gorm.DB
-	// AfterCalibration 校准记录落库后的联动（计划核销、档案日期滚动）。
-	AfterCalibration func(context.Context, *TCaliRecord)
+	// AfterIssue 发证事务内联动（核销计划行、滚动档案检定日期），随发证一起提交或回滚。
+	AfterIssue func(context.Context, *gorm.DB, *TCaliRecord) error
 }
 
 func NewRecordService(db *gorm.DB) *RecordService { return &RecordService{db: db} }
@@ -66,9 +66,6 @@ func (s *RecordService) Create(ctx context.Context, in RecordInput) (*TCaliRecor
 	if err := s.db.WithContext(ctx).Create(&rec).Error; err != nil {
 		return nil, err
 	}
-	if s.AfterCalibration != nil {
-		s.AfterCalibration(ctx, &rec)
-	}
 	return &rec, nil
 }
 
@@ -108,21 +105,34 @@ func (s *RecordService) Update(ctx context.Context, id uint64, in RecordInput) e
 	return nil
 }
 
-// Issue 发证：回填证书编号，状态由「已登记」转为「已发证」。
+// Issue 发证：回填证书编号，状态由「已登记」转为「已发证」；
+// 同一事务内核销对应计划行并滚动档案检定日期，失败整体回滚。
 func (s *RecordService) Issue(ctx context.Context, id uint64, certNo string) error {
 	if certNo == "" {
 		return common.NewBizError("证书编号不能为空")
 	}
-	tx := s.db.WithContext(ctx).Model(&TCaliRecord{}).
-		Where("id = ? AND status = 0", id).
-		Updates(map[string]any{"cert_no": certNo, "status": 1})
-	if tx.Error != nil {
-		return tx.Error
-	}
-	if tx.RowsAffected == 0 {
-		return common.NewBizError("记录不存在或已发证")
-	}
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		tx = tx.WithContext(ctx)
+		upd := tx.Model(&TCaliRecord{}).
+			Where("id = ? AND status = 0", id).
+			Updates(map[string]any{"cert_no": certNo, "status": 1})
+		if upd.Error != nil {
+			return upd.Error
+		}
+		if upd.RowsAffected == 0 {
+			return common.NewBizError("记录不存在或已发证")
+		}
+		if s.AfterIssue != nil {
+			var rec TCaliRecord
+			if err := tx.First(&rec, id).Error; err != nil {
+				return err
+			}
+			if err := s.AfterIssue(ctx, tx, &rec); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // List 列表查询：记录编号模糊 + 状态筛选，分页返回。

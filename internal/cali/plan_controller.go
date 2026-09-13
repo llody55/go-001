@@ -65,7 +65,14 @@ func (ctl *PlanController) list(c *gin.Context) {
 }
 
 func (ctl *PlanController) enable(c *gin.Context) {
-	if err := ctl.svc.EnableNoticeJob(c.Request.Context(), "0 8 * * *"); err != nil {
+	var body struct {
+		CronExpr string `json:"cronExpr"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	if body.CronExpr == "" {
+		body.CronExpr = "0 8 * * *" // 默认每日 08:00
+	}
+	if err := ctl.svc.EnableNoticeJob(c.Request.Context(), body.CronExpr); err != nil {
 		response.AbortBiz(c, err)
 		return
 	}
@@ -73,6 +80,10 @@ func (ctl *PlanController) enable(c *gin.Context) {
 }
 
 func (ctl *PlanController) scan(c *gin.Context) {
-	ctl.svc.ScanOverdue(c.Request.Context())
-	response.OK(c, gin.H{"scanned": 1})
+	n, err := ctl.svc.ScanOverdue(c.Request.Context())
+	if err != nil {
+		response.AbortBiz(c, err)
+		return
+	}
+	response.OK(c, gin.H{"notified": n})
 }

@@ -30,7 +30,7 @@ func NewEngine(gdb *gorm.DB, jwtSecret string, expireHours int) *gin.Engine {
 
 	recordSvc := cali.NewRecordService(gdb)
 	planSvc := cali.NewPlanService(gdb, scheduler)
-	recordSvc.AfterCalibration = planSvc.AfterCalibration
+	recordSvc.AfterIssue = planSvc.AfterIssue
 
 	caliCtl := cali.NewController(recordSvc)
 	caliCtl.Register(protected)

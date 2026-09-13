@@ -65,17 +65,39 @@ func (s *Scheduler) Start() error {
 
 func (s *Scheduler) Stop() { s.cron.Stop() }
 
-// AddJob 配置落库后再加入调度。
+// AddJob 配置落库后再加入调度；同一 func_key 只允许一条启用配置，重复开启返回业务错误。
 func (s *Scheduler) AddJob(job TSysJob) error {
-	if err := s.scheduleEntry(job); err != nil {
+	s.mu.Lock()
+	f, ok := s.funcs[job.FuncKey]
+	s.mu.Unlock()
+	if !ok {
+		return common.NewBizError("未注册的任务类型：" + job.FuncKey)
+	}
+	if _, err := cron.ParseStandard(job.CronExpr); err != nil {
+		return common.NewBizError("cron 表达式不正确：" + job.CronExpr)
+	}
+	var dup int64
+	if err := s.db.Model(&TSysJob{}).
+		Where("func_key = ? and status = 0", job.FuncKey).Count(&dup).Error; err != nil {
 		return err
 	}
-	return s.db.Create(&job).Error
+	if dup > 0 {
+		return common.NewBizError("该任务已启用，请勿重复开启")
+	}
+	if err := s.db.Create(&job).Error; err != nil {
+		return err
+	}
+	if _, err := s.cron.AddFunc(job.CronExpr, f); err != nil {
+		return common.NewBizError("cron 表达式不正确：" + job.CronExpr)
+	}
+	return nil
 }
 
 // scheduleEntry 只加入调度、不落库（启动恢复时用，避免把库里已有的任务再插一遍）。
 func (s *Scheduler) scheduleEntry(job TSysJob) error {
+	s.mu.Lock()
 	f, ok := s.funcs[job.FuncKey]
+	s.mu.Unlock()
 	if !ok {
 		return common.NewBizError("未注册的任务类型：" + job.FuncKey)
 	}

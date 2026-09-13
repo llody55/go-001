@@ -2,6 +2,7 @@ package cali
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -13,6 +14,9 @@ import (
 	"metrobase/internal/db"
 )
 
+// 催检任务在 t_sys_job 中的函数标识，调度器据此从库里恢复。
+const noticeFuncKey = "calibration_due_notice"
+
 // PlanService 年度检定计划编制、到期看板与提醒。
 type PlanService struct {
 	db    *gorm.DB
@@ -22,8 +26,9 @@ type PlanService struct {
 func NewPlanService(gdb *gorm.DB, sched *cronjob.Scheduler) *PlanService {
 	s := &PlanService{db: gdb, sched: sched}
 	if sched != nil {
-		sched.RegisterFunc("calibration_due_notice", func() {
-			s.ScanOverdue(context.Background())
+		// 任务体只注册一次；是否启用、几点执行，以 t_sys_job 里的持久化配置为准。
+		sched.RegisterFunc(noticeFuncKey, func() {
+			_, _ = s.ScanOverdue(context.Background())
 		})
 	}
 	return s
@@ -36,43 +41,60 @@ type GeneratePlanInput struct {
 type PlanListQuery struct {
 	Year     int    `form:"year" json:"year"`
 	Status   *int   `form:"status" json:"status"`
-	DueState string `form:"dueState" json:"dueState"` // overdue=已超期 soon=30天内到期
+	DueState string `form:"dueState" json:"dueState"` // overdue=已超期 soon=30天内到期 done=已完成
 	Page     common.PageQuery
 }
 
-// Generate 按器具档案的周期与上次校准日期，排出指定年度内的应校准日期。
+// Generate 按器具档案的上次校准日期与检定周期，排出指定年度内的应校准日期。
+// 同一 (器具, 计划日期) 不重复建行，可对同一年度重复执行补排。
 func (s *PlanService) Generate(ctx context.Context, in GeneratePlanInput) ([]TCaliPlan, error) {
 	if in.Year < 2000 || in.Year > 2200 {
 		return nil, common.NewBizError("计划年度不正确")
 	}
 	var devs []TCaliDevice
-	if err := s.db.WithContext(ctx).Find(&devs).Error; err != nil {
+	// 停用器具不纳入年度计划。
+	if err := s.db.WithContext(ctx).Clauses(db.Read()).
+		Where("status = 0 and last_calib_date <> '' and cycle_months > 0").
+		Find(&devs).Error; err != nil {
 		return nil, err
 	}
 
 	yearStart := time.Date(in.Year, 1, 1, 0, 0, 0, 0, time.Local)
 	yearEnd := time.Date(in.Year+1, 1, 1, 0, 0, 0, 0, time.Local)
 
+	// 已排计划用于幂等去重，同时作为计划编号续号依据。
+	var existed []TCaliPlan
+	if err := s.db.WithContext(ctx).Clauses(db.Read()).
+		Select("device_id", "plan_date").
+		Where("year = ?", in.Year).Find(&existed).Error; err != nil {
+		return nil, err
+	}
+	existSet := make(map[string]struct{}, len(existed))
+	for _, p := range existed {
+		existSet[planDedupKey(p.DeviceID, p.PlanDate)] = struct{}{}
+	}
+
 	var rows []TCaliPlan
 	for _, dev := range devs {
-		if dev.LastCalibDate == "" || dev.CycleMonths <= 0 {
-			continue
-		}
 		last, err := time.ParseInLocation("2006-01-02", dev.LastCalibDate, time.Local)
 		if err != nil {
 			continue
 		}
 		due := last.AddDate(0, dev.CycleMonths, 0)
 		for due.Before(yearEnd) {
-			if due.After(yearStart) {
-				rows = append(rows, TCaliPlan{
-					Year:       in.Year,
-					DeviceID:   dev.ID,
-					DeviceNo:   dev.DeviceNo,
-					DeviceName: dev.DeviceName,
-					PlanDate:   due.Format("2006-01-02"),
-					Status:     0,
-				})
+			if !due.Before(yearStart) {
+				date := due.Format("2006-01-02")
+				if _, ok := existSet[planDedupKey(dev.ID, date)]; !ok {
+					rows = append(rows, TCaliPlan{
+						Year:       in.Year,
+						DeviceID:   dev.ID,
+						DeviceNo:   dev.DeviceNo,
+						DeviceName: dev.DeviceName,
+						PlanDate:   date,
+						Status:     0,
+					})
+					existSet[planDedupKey(dev.ID, date)] = struct{}{}
+				}
 			}
 			due = due.AddDate(0, dev.CycleMonths, 0)
 		}
@@ -85,7 +107,7 @@ func (s *PlanService) Generate(ctx context.Context, in GeneratePlanInput) ([]TCa
 		return rows[i].PlanDate < rows[j].PlanDate
 	})
 	for i := range rows {
-		rows[i].PlanNo = fmt.Sprintf("RP-%d-%03d", in.Year, i+1)
+		rows[i].PlanNo = fmt.Sprintf("RP-%d-%03d", in.Year, len(existed)+i+1)
 	}
 	if len(rows) > 0 {
 		if err := s.db.WithContext(ctx).Create(&rows).Error; err != nil {
@@ -93,6 +115,10 @@ func (s *PlanService) Generate(ctx context.Context, in GeneratePlanInput) ([]TCa
 		}
 	}
 	return rows, nil
+}
+
+func planDedupKey(deviceID uint64, date string) string {
+	return fmt.Sprintf("%d@%s", deviceID, date)
 }
 
 // List 到期看板：按年度、状态、到期情况查询，分页返回。
@@ -110,65 +136,84 @@ func (s *PlanService) List(ctx context.Context, query PlanListQuery) (*common.Li
 	today := time.Now().Format("2006-01-02")
 	soonEnd := time.Now().AddDate(0, 0, 30).Format("2006-01-02")
 	switch query.DueState {
-	case "overdue":
+	case "overdue": // 已超期：未完成且计划日期早于今天
 		q = q.Where("status = 0 and plan_date < ?", today)
-	case "soon":
+	case "soon": // 30 天内到期：含今天起 30 天
 		q = q.Where("status = 0 and plan_date >= ? and plan_date <= ?", today, soonEnd)
+	case "done": // 已完成
+		q = q.Where("status = 1")
 	}
 	if err := q.Count(&total).Error; err != nil {
 		return nil, err
 	}
 	if err := q.Scopes(common.Paginate(query.Page)).
-		Order("plan_date asc").Find(&rows).Error; err != nil {
+		Order("plan_date asc, id asc").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	return &common.ListResult{List: rows, Total: total}, nil
 }
 
-// EnableNoticeJob 启用每日到期提醒任务。
+// EnableNoticeJob 启用每日催检任务：配置（含 cron 表达式）持久化到 t_sys_job
+// 并立即加入调度；进程重启后由调度器从库里自动恢复，重复开启会被拒绝。
 func (s *PlanService) EnableNoticeJob(ctx context.Context, cronExpr string) error {
 	if cronExpr == "" {
 		return common.NewBizError("执行时间表达式不能为空")
 	}
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.ScanOverdue(context.Background())
-		}
-	}()
-	return nil
+	if s.sched == nil {
+		return common.NewBizError("定时任务调度器未就绪")
+	}
+	return s.sched.AddJob(cronjob.TSysJob{
+		JobName:  "每日到期催检",
+		FuncKey:  noticeFuncKey,
+		CronExpr: cronExpr,
+		Status:   0,
+	})
 }
 
-// ScanOverdue 扫描超期未完成的计划行，记一次提醒时间。
-func (s *PlanService) ScanOverdue(ctx context.Context) {
+// ScanOverdue 每日催检：扫描到期（含当天）仍未完成的计划行，刷新提醒时间。
+// 每天执行都会覆盖 notice_time，因此它记录的是最近一次催检时间。
+func (s *PlanService) ScanOverdue(ctx context.Context) (int64, error) {
 	today := time.Now().Format("2006-01-02")
-	s.db.WithContext(ctx).Model(&TCaliPlan{}).
-		Where("status = 0 and plan_date < ? and notice_time is null", today).
+	tx := s.db.WithContext(ctx).Model(&TCaliPlan{}).
+		Where("status = 0 and plan_date <= ?", today).
 		Update("notice_time", time.Now())
+	return tx.RowsAffected, tx.Error
 }
 
-// AfterCalibration 一条校准记录落库后，联动核销计划并滚动档案下次到期日。
-func (s *PlanService) AfterCalibration(ctx context.Context, rec *TCaliRecord) {
-	if rec == nil || rec.CalibDate == "" || len(rec.CalibDate) < 4 {
-		return
+// AfterIssue 发证后的事务内联动：核销对应的待安排计划行，并按校准日期滚动档案
+// 检定日期。任一步失败随发证事务整体回滚。
+func (s *PlanService) AfterIssue(ctx context.Context, tx *gorm.DB, rec *TCaliRecord) error {
+	if rec == nil {
+		return nil
 	}
-	year := 0
-	for i := 0; i < 4; i++ {
-		year = year*10 + int(rec.CalibDate[i]-'0')
+	// 核销该器具「计划日期 <= 本次校准日期」中最早的一条待安排行：
+	// 一次发证只核销一行，更早被漏掉的计划行优先核销。
+	var plan TCaliPlan
+	err := tx.WithContext(ctx).
+		Where("device_id = ? and status = 0 and plan_date <= ?", rec.DeviceID, rec.CalibDate).
+		Order("plan_date asc, id asc").First(&plan).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
 	}
-	s.db.WithContext(ctx).Model(&TCaliPlan{}).
-		Where("device_id = ? and year = ? and status = 0", rec.DeviceID, year).
-		Updates(map[string]any{"status": 1, "record_id": rec.ID})
+	if plan.ID != 0 {
+		if err := tx.WithContext(ctx).Model(&TCaliPlan{}).Where("id = ?", plan.ID).
+			Updates(map[string]any{"status": 1, "record_id": rec.ID}).Error; err != nil {
+			return err
+		}
+	}
 
+	// 以本次校准日期为基准滚动档案的上次/下次检定日期。
 	var dev TCaliDevice
-	if err := s.db.WithContext(ctx).First(&dev, rec.DeviceID).Error; err != nil {
-		return
+	if err := tx.WithContext(ctx).First(&dev, rec.DeviceID).Error; err != nil {
+		return err
 	}
-	now := time.Now()
-	s.db.WithContext(ctx).Model(&TCaliDevice{}).Where("id = ?", dev.ID).
+	calib, err := time.ParseInLocation("2006-01-02", rec.CalibDate, time.Local)
+	if err != nil {
+		return common.NewBizError("校准日期格式不正确，应为 yyyy-MM-dd")
+	}
+	return tx.WithContext(ctx).Model(&TCaliDevice{}).Where("id = ?", dev.ID).
 		Updates(map[string]any{
-			"last_calib_date": now.Format("2006-01-02"),
-			"next_calib_date": now.AddDate(0, dev.CycleMonths, 0).Format("2006-01-02"),
-		})
+			"last_calib_date": rec.CalibDate,
+			"next_calib_date": calib.AddDate(0, dev.CycleMonths, 0).Format("2006-01-02"),
+		}).Error
 }
